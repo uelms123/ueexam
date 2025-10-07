@@ -111,7 +111,7 @@ app.post('/api/auth/get-role', async (req, res) => {
 
 // Initialize admin user
 async function initializeAdminUser() {
-  const email = 'admin@gmail.com';
+  const email = 'uelms2025@gmail.com';
   const password = 'admin123';
   try {
     const existingUser = await admin.auth().getUserByEmail(email).catch(err => null);
