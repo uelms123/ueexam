@@ -6,6 +6,8 @@ const Submission = require('../models/submission.model');
 const ExamReport = require('../models/examReport.model');
 const admin = require('../firebaseAdmin');
 const multer = require('multer');
+const archiver = require('archiver');
+const { Readable } = require('stream');
 
 // Configure multer for memory storage
 const storage = multer.memoryStorage();
@@ -61,7 +63,7 @@ const handleMulterError = (err, req, res, next) => {
 
 // Create a new exam
 exports.createExam = [upload, handleMulterError, async (req, res) => {
-  const { title, class: classId, description, startDate, endDate, duration, questions } = req.body;
+  const { title, class: classId, description, startDate, endDate, duration, uploadDuration, questions } = req.body;
 
   try {
     let parsedQuestions = [];
@@ -77,10 +79,13 @@ exports.createExam = [upload, handleMulterError, async (req, res) => {
     }
 
     parsedQuestions.forEach(q => {
-      if (q.type === 'file' && !q.description) {
-        throw new Error('File questions must have a description');
+      if (!q.description) {
+        throw new Error('All questions must have a description');
       }
-      if (!q.fileTypesAllowed || typeof q.fileTypesAllowed !== 'object') {
+      if (q.type === 'mcq' && (!q.options || q.options.length < 2)) {
+        throw new Error('MCQ questions must have at least 2 options');
+      }
+      if (q.type === 'file' && !q.fileTypesAllowed) {
         q.fileTypesAllowed = {
           pdf: true,
           doc: false,
@@ -91,7 +96,7 @@ exports.createExam = [upload, handleMulterError, async (req, res) => {
       }
     });
 
-    // Handle file uploads
+    // Handle file uploads only for file-type questions
     const files = req.files;
     if (files) {
       const uploadPromises = Object.entries(files).map(([fieldName, fileArray]) => {
@@ -99,6 +104,7 @@ exports.createExam = [upload, handleMulterError, async (req, res) => {
         const match = fieldName.match(/questionFiles\[(\d+)\]/);
         if (!match) return;
         const index = match[1];
+        if (!parsedQuestions[index] || parsedQuestions[index].type !== 'file') return;
         return new Promise((resolve, reject) => {
           const filename = `exam-questions/${Date.now()}-${file.originalname}`;
           const blob = bucket.file(filename);
@@ -132,6 +138,7 @@ exports.createExam = [upload, handleMulterError, async (req, res) => {
       startDate: new Date(startDate),
       endDate: new Date(endDate),
       duration: parseInt(duration),
+      uploadDuration: parseInt(uploadDuration),
       questions: parsedQuestions
     });
     await exam.save();
@@ -165,15 +172,19 @@ exports.createExam = [upload, handleMulterError, async (req, res) => {
 
     res.status(201).json(exam);
   } catch (error) {
-    console.error('Error creating exam:', error.message);
+    console.error('Error creating exam:', error);
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(e => e.message).join(', ');
+      return res.status(400).json({ error: messages });
+    }
     res.status(400).json({ error: error.message });
   }
 }];
 
 // Update an exam
-exports.updateExam = async (req, res) => {
+exports.updateExam = [upload, handleMulterError, async (req, res) => {
   const { id } = req.params;
-  const { title, class: classId, description, startDate, endDate, duration, questions } = req.body;
+  const { title, class: classId, description, startDate, endDate, duration, uploadDuration, questions } = req.body;
 
   try {
     const oldExam = await Exam.findById(id).populate('class');
@@ -190,10 +201,13 @@ exports.updateExam = async (req, res) => {
     }
 
     parsedQuestions.forEach(q => {
-      if (q.type === 'file' && !q.description) {
-        throw new Error('File questions must have a description');
+      if (!q.description) {
+        throw new Error('All questions must have a description');
       }
-      if (!q.fileTypesAllowed || typeof q.fileTypesAllowed !== 'object') {
+      if (q.type === 'mcq' && (!q.options || q.options.length < 2)) {
+        throw new Error('MCQ questions must have at least 2 options');
+      }
+      if (q.type === 'file' && !q.fileTypesAllowed) {
         q.fileTypesAllowed = {
           pdf: true,
           doc: false,
@@ -204,6 +218,7 @@ exports.updateExam = async (req, res) => {
       }
     });
 
+    // Handle file uploads only for file-type questions
     const files = req.files;
     if (files) {
       const uploadPromises = Object.entries(files).map(([fieldName, fileArray]) => {
@@ -211,6 +226,7 @@ exports.updateExam = async (req, res) => {
         const match = fieldName.match(/questionFiles\[(\d+)\]/);
         if (!match) return;
         const index = match[1];
+        if (!parsedQuestions[index] || parsedQuestions[index].type !== 'file') return;
         return new Promise((resolve, reject) => {
           const filename = `exam-questions/${Date.now()}-${file.originalname}`;
           const blob = bucket.file(filename);
@@ -230,7 +246,7 @@ exports.updateExam = async (req, res) => {
 
       const uploadedFiles = await Promise.all(uploadPromises);
       uploadedFiles.forEach(({ index, url, fileType }) => {
-        if (parsedQuestions[index] && parsedQuestions[index].type === 'file') {
+        if (parsedQuestions[index]) {
           parsedQuestions[index].fileUrl = url;
           parsedQuestions[index].fileType = fileType;
         }
@@ -269,6 +285,7 @@ exports.updateExam = async (req, res) => {
         startDate,
         endDate,
         duration: parseInt(duration),
+        uploadDuration: parseInt(uploadDuration),
         questions: parsedQuestions
       },
       { new: true }
@@ -339,44 +356,30 @@ exports.updateExam = async (req, res) => {
     console.log('Exam updated in MongoDB:', updatedExam._id);
     res.json(updatedExam);
   } catch (error) {
-    console.error('Error updating exam:', error.message);
+    console.error('Error updating exam:', error);
+    if (error.name === 'ValidationError') {
+      const messages = Object.values(error.errors).map(e => e.message).join(', ');
+      return res.status(400).json({ error: messages });
+    }
     res.status(400).json({ error: error.message });
   }
-};
-
-// Apply multer middleware and error handling for updateExam
-exports.updateExam = [upload, handleMulterError, exports.updateExam];
+}];
 
 // Delete an exam
 exports.deleteExam = async (req, res) => {
   const { id } = req.params;
+
   try {
-    console.log('Deleting exam with ID:', id);
     const examDoc = await Exam.findById(id).populate('class');
     if (!examDoc) {
       console.log('Exam not found for ID:', id);
       return res.status(404).json({ error: 'Exam not found' });
     }
 
-    const fileUrls = examDoc.questions
-      .filter(q => q.type === 'file' && q.fileUrl)
-      .map(q => q.fileUrl);
-    if (fileUrls.length > 0) {
-      try {
-        const deletePromises = fileUrls.map(async (url) => {
-          const filePath = url.split(`${bucket.name}/`)[1];
-          if (filePath) {
-            console.log(`Deleting file from Firebase: ${filePath}`);
-            await bucket.file(filePath).delete();
-          }
-        });
-        await Promise.all(deletePromises);
-      } catch (err) {
-        console.warn(`Failed to delete some files for exam ${id}:`, err.message);
-      }
-    }
-
     await Exam.findByIdAndDelete(id);
+    console.log('Exam deleted from MongoDB:', id);
+
+    // Remove from class
     if (examDoc.class) {
       const classDoc = await Class.findById(examDoc.class._id);
       if (classDoc) {
@@ -505,6 +508,7 @@ exports.getExamReport = async (req, res) => {
       .populate('examId', 'title startDate')
       .populate('studentId', 'name email');
     if (!report) {
+      console.log(`No report found for exam ID: ${examId}, UID: ${uid}`);
       return res.status(404).json({ error: 'No report found' });
     }
     console.log('Exam report fetched:', report._id);
@@ -648,6 +652,11 @@ exports.uploadStudentFile = [
         return res.status(404).json({ error: 'Student not found' });
       }
 
+      const exam = await Exam.findById(examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
       const filename = `student-submissions/${uid}/${examId}/${questionId}/${Date.now()}-${req.file.originalname}`;
       const blob = bucket.file(filename);
       const blobStream = blob.createWriteStream({
@@ -690,12 +699,27 @@ exports.getStudentSubmissions = async (req, res) => {
   const { examId, uid } = req.params;
   try {
     console.log(`Fetching submissions for exam ID: ${examId}, UID: ${uid}`);
+    const exam = await Exam.findById(examId);
+    if (!exam) {
+      console.log(`Exam not found for ID: ${examId}`);
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    const student = await Student.findOne({ uid });
+    if (!student) {
+      console.log(`Student not found for UID: ${uid}`);
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
     const submissions = await Submission.find({ examId, uid })
-      .populate('studentId', 'name uid email');
+      .populate('studentId', 'name uid email')
+      .lean();
+
     if (!submissions || submissions.length === 0) {
       console.log(`No submissions found for exam ID: ${examId}, UID: ${uid}`);
-      return res.status(404).json({ error: 'No submissions found' });
+      return res.json([]); // Return empty array instead of 404 to match frontend expectation
     }
+
     console.log(`Found ${submissions.length} submissions for exam ID: ${examId}, UID: ${uid}`);
     res.json(submissions);
   } catch (error) {
@@ -748,5 +772,130 @@ exports.getStudentsByExamSubmissions = async (req, res) => {
   }
 };
 
+// Download all submissions as a ZIP file
+exports.downloadAllSubmissions = async (req, res) => {
+  const { examId } = req.params;
+  try {
+    console.log(`Fetching all submissions for exam ID: ${examId}`);
+    const exam = await Exam.findById(examId).select('title');
+    if (!exam) {
+      console.log(`Exam not found for ID: ${examId}`);
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    const submissions = await Submission.find({ examId })
+      .populate('studentId', 'name email uid')
+      .lean();
+
+    if (!submissions || submissions.length === 0) {
+      console.log(`No submissions found for exam ID: ${examId}`);
+      return res.status(404).json({ error: 'No submissions found for this exam' });
+    }
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    const sanitizedExamTitle = exam.title.replace(/[^a-zA-Z0-9-_]/g, '_');
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename=${sanitizedExamTitle}_submissions.zip`);
+
+    archive.on('error', (err) => {
+      console.error('Archive error:', err);
+      res.status(500).json({ error: 'Failed to create ZIP file' });
+    });
+
+    archive.pipe(res);
+
+    for (const submission of submissions) {
+      const fileUrl = submission.fileUrl;
+      if (!fileUrl) continue;
+
+      try {
+        const filePath = fileUrl.split(`${bucket.name}/`)[1];
+        if (!filePath) {
+          console.warn(`Invalid file URL for submission: ${fileUrl}`);
+          continue;
+        }
+
+        const file = bucket.file(filePath);
+        const [metadata] = await file.getMetadata();
+        const fileName = `${submission.studentId.name || submission.studentId.uid}_Q${submission.questionId}_${filePath.split('/').pop()}`;
+        
+        const [fileBuffer] = await file.download();
+        archive.append(Readable.from(fileBuffer), { name: fileName });
+        console.log(`Added file to ZIP: ${fileName}`);
+      } catch (err) {
+        console.warn(`Failed to download file ${fileUrl}: ${err.message}`);
+      }
+    }
+
+    await archive.finalize();
+    console.log(`ZIP file created for exam ID: ${examId}`);
+  } catch (error) {
+    console.error(`Error downloading submissions for exam ID: ${examId}:`, error.message);
+    res.status(500).json({ error: `Server error: ${error.message}` });
+  }
+};
+
+// Download all reports as a ZIP file
+exports.downloadAllReports = async (req, res) => {
+  const { examId } = req.params;
+  try {
+    console.log(`Fetching all reports for exam ID: ${examId}`);
+    const exam = await Exam.findById(examId).select('title');
+    if (!exam) {
+      console.log(`Exam not found for ID: ${examId}`);
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    const reports = await ExamReport.find({ examId })
+      .populate('studentId', 'name email uid')
+      .lean();
+
+    if (!reports || reports.length === 0) {
+      console.log(`No reports found for exam ID: ${examId}`);
+      return res.status(404).json({ error: 'No reports found for this exam' });
+    }
+
+    const archive = archiver('zip', { zlib: { level: 9 } });
+    const sanitizedExamTitle = exam.title.replace(/[^a-zA-Z0-9-_]/g, '_');
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename=${sanitizedExamTitle}_reports.zip`);
+
+    archive.on('error', (err) => {
+      console.error('Archive error:', err);
+      res.status(500).json({ error: 'Failed to create ZIP file' });
+    });
+
+    archive.pipe(res);
+
+    for (const report of reports) {
+      const fileUrl = report.reportUrl;
+      if (!fileUrl) continue;
+
+      try {
+        const filePath = fileUrl.split(`${bucket.name}/`)[1];
+        if (!filePath) {
+          console.warn(`Invalid file URL for report: ${fileUrl}`);
+          continue;
+        }
+
+        const file = bucket.file(filePath);
+        const [metadata] = await file.getMetadata();
+        const fileName = `${report.studentId.name || report.studentId.uid}_ExamReport_${filePath.split('/').pop()}`;
+        
+        const [fileBuffer] = await file.download();
+        archive.append(Readable.from(fileBuffer), { name: fileName });
+        console.log(`Added report to ZIP: ${fileName}`);
+      } catch (err) {
+        console.warn(`Failed to download report ${fileUrl}: ${err.message}`);
+      }
+    }
+
+    await archive.finalize();
+    console.log(`ZIP file created for exam ID: ${examId}`);
+  } catch (error) {
+    console.error(`Error downloading reports for exam ID: ${examId}:`, error.message);
+    res.status(500).json({ error: `Server error: ${error.message}` });
+  }
+};
 
 exports.upload = upload;

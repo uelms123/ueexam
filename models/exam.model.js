@@ -5,12 +5,13 @@ const questionSchema = new mongoose.Schema({
   description: { type: String, required: true },
   type: { 
     type: String, 
-    enum: ['file'],
-    default: 'file',
+    enum: ['mcq', 'descriptive', 'file'],
+    default: 'mcq',
     required: true 
   },
-  fileUrl: { type: String },
-  fileType: { type: String },
+  options: [{ type: String }], 
+  fileUrl: { type: String }, 
+  fileType: { type: String }, 
   fileTypesAllowed: {
     pdf: { type: Boolean, default: false },
     doc: { type: Boolean, default: false },
@@ -23,14 +24,18 @@ const questionSchema = new mongoose.Schema({
 const examSchema = new mongoose.Schema({
   title: { type: String, required: true },
   class: { type: mongoose.Schema.Types.ObjectId, ref: 'Class', required: true },
-  description: String,
   startDate: { type: Date, required: true },
   endDate: { type: Date, required: true },
   duration: { 
     type: Number, 
     required: true,
     min: [1, 'Duration must be at least 1 minute']
-  }, // in minutes
+  }, // Total exam duration in minutes
+  uploadDuration: { 
+    type: Number, 
+    required: true,
+    min: [1, 'Upload duration must be at least 1 minute']
+  }, // Upload duration in minutes
   questions: [questionSchema]
 }, { timestamps: true });
 
