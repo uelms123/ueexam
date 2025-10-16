@@ -37,8 +37,8 @@ const port = process.env.PORT || 5000;
 
 app.use(express.urlencoded({ extended: true }));
 app.use(cors({
-  origin: 'https://uelms.com', // Adjust to your frontend origin
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
 app.use(express.json());
