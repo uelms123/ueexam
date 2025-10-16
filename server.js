@@ -1,176 +1,75 @@
-require('dotenv').config();
 const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
-const bodyParser = require('body-parser');
-const admin = require('./firebaseAdmin');
+const classRoutes = require('./routes/classRoutes');
+const announcementRoutes = require('./routes/announcementRoutes');
+const unitRoutes = require('./routes/unitRoutes');
+const assignmentRoutes = require('./routes/assignments');
+const submissionRoutes = require('./routes/submissions');
+const staffRoutes = require('./routes/staffRoutes');
+const studentRoutes = require('./routes/studentRoutes');
+const admin = require('firebase-admin');
+const messageRoutes = require('./routes/messages');
+const studLogin = require('./routes/activityRoutes');
+require('dotenv').config();
 
-// Import Routes
-const studentRoutes = require('./routes/student.routes');
-const classRoutes = require('./routes/class.routes');
-const examRoutes = require('./routes/exam.routes');
+console.log('FIREBASE_PRIVATE_KEY:', process.env.FIREBASE_PRIVATE_KEY ? 'Defined' : 'Undefined');
 
-const app = express();
-const PORT = process.env.PORT || 5000;
-
-// Increase server timeout for large file uploads (30 seconds)
-app.set('timeout', 30000);
-
-// Enable CORS with explicit support for multipart/form-data
-const allowedOrigins = [
-  'http://localhost:3000',
-  'https://ueexam.vercel.app',
-  'https://ueexams.com',
-];
-
-const corsOptions = {
-  origin: function (origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      console.warn('❌ CORS blocked origin:', origin);
-      callback(null, false); // Don't throw!
-    }
-  },
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
-  credentials: true
+const firebaseConfig = {
+  projectId: process.env.FIREBASE_PROJECT_ID,
+  clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+  privateKey: process.env.FIREBASE_PRIVATE_KEY
+    ? process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n')
+    : undefined,
 };
 
-app.use(cors(corsOptions));
-
-// Middleware for parsing JSON and URL-encoded data
-app.use(bodyParser.json({ limit: '50mb' }));
-app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
-
-// MongoDB Connection
-const connectDB = async () => {
-  try {
-    if (!process.env.MONGODB_URI) {
-      throw new Error('MONGODB_URI is not defined in environment variables');
-    }
-    console.log('Attempting to connect to MongoDB...');
-    await mongoose.connect(process.env.MONGODB_URI, {
-      serverSelectionTimeoutMS: 5000,
-      socketTimeoutMS: 45000,
-    });
-    console.log('MongoDB connected successfully');
-    console.log('Loading Mongoose models...');
-    require('./models/student.model');
-    console.log('Student model loaded');
-    require('./models/class.model');
-    console.log('Class model loaded');
-    require('./models/exam.model');
-    console.log('Exam model loaded');
-
-    mongoose.connection.on('error', (err) => {
-      console.error('MongoDB connection error:', err);
-    });
-    mongoose.connection.on('disconnected', () => {
-      console.log('MongoDB disconnected');
-    });
-    process.on('SIGINT', async () => {
-      await mongoose.connection.close();
-      console.log('MongoDB connection closed due to app termination');
-      process.exit(0);
-    });
-  } catch (error) {
-    console.error('MongoDB connection failed:', error.message);
-    if (process.env.NODE_ENV === 'production') {
-      process.exit(1);
-    }
-  }
-};
-
-connectDB();
-
-// Use routes
-app.use('/api/students', studentRoutes);
-app.use('/api/classes', classRoutes);
-app.use('/api/exams', examRoutes);
-
-// Route for getting user role
-app.post('/api/auth/get-role', async (req, res) => {
-  const { uid } = req.body;
-  try {
-    console.log('Fetching role for UID:', uid);
-    const Student = require('./models/student.model');
-    let user = await Student.findOne({ uid });
-    if (user) {
-      console.log('Found student:', user);
-      return res.json({ role: 'student' });
-    }
-
-    console.log('User not found for UID:', uid);
-    res.status(404).json({ error: 'User not found' });
-  } catch (error) {
-    console.error('Error fetching role:', error.message);
-    res.status(500).json({ error: `Server error: ${error.message}` });
-  }
-});
-
-// Initialize admin user
-async function initializeAdminUser() {
-  const email = 'uelms2025@gmail.com';
-  const password = 'admin123';
-  try {
-    const existingUser = await admin.auth().getUserByEmail(email).catch(err => null);
-    if (existingUser) {
-      console.log(`Admin user ${email} already exists with UID: ${existingUser.uid}`);
-      return;
-    }
-    const userRecord = await admin.auth().createUser({ email, password });
-    console.log('Admin user created with UID:', userRecord.uid);
-  } catch (error) {
-    console.error('Error initializing admin user:', error.message);
-  }
+if (!firebaseConfig.projectId || !firebaseConfig.clientEmail || !firebaseConfig.privateKey) {
+  console.error('Missing Firebase configuration variables');
+  process.exit(1);
 }
 
-initializeAdminUser();
+admin.initializeApp({
+  credential: admin.credential.cert(firebaseConfig),
+});
 
-// Health check route
-app.get('/health', (req, res) => {
-  const dbStatus = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
-  res.status(200).json({ 
-    status: 'OK', 
-    database: dbStatus,
-    timestamp: new Date().toISOString()
+const app = express();
+const port = process.env.PORT || 5000;
+
+app.use(express.urlencoded({ extended: true }));
+app.use(cors({
+  origin: 'https://uelms.onrender.com', // Adjust to your frontend origin
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.use(express.json());
+
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => {
+    console.log('Connected to MongoDB');
+  })
+  .catch((err) => {
+    console.error('MongoDB connection error:', err);
   });
+
+const path = require('path');
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Log all requests for debugging
+app.use((req, res, next) => {
+  console.log(`${req.method} request to ${req.path}`);
+  next();
 });
 
-// Default route
-app.get('/', (req, res) => {
-  res.send('Online Exam Monitoring API Running...');
-});
+app.use('/api/classes', classRoutes);
+app.use('/api/announcements', announcementRoutes);
+app.use('/api/units', unitRoutes);
+app.use('/api/assignments', assignmentRoutes);
+app.use('/api/submissions', submissionRoutes);
+app.use('/api', staffRoutes);
+app.use('/api/students', studentRoutes);
+app.use('/api/messages', messageRoutes);
+app.use('/api/activity', studLogin);
 
-// Handle 404
-app.use((req, res) => {
-  res.status(404).json({ message: 'Route not found' });
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Server error:', err.stack);
-  if (err.message.includes('Unexpected end of form')) {
-    res.status(400).json({ message: 'Invalid form data: Incomplete or malformed multipart form' });
-  } else {
-    res.status(500).json({ message: 'Internal server error', details: err.message });
-  }
-});
-
-// Start server
-mongoose.connection.once('open', () => {
-  app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
-    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log('Models available:', Object.keys(mongoose.models));
-  });
-});
-
-mongoose.connection.on('error', (err) => {
-  console.error('MongoDB connection error:', err);
-  if (process.env.NODE_ENV === 'production') {
-    console.log('Exiting process due to MongoDB connection failure');
-    process.exit(1);
-  }
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
