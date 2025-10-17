@@ -1,5 +1,6 @@
+// exam.controller.js
 const Exam = require('../models/exam.model');
-const Class = require('../models/class.model');
+const School = require('../models/school.model');
 const Student = require('../models/student.model');
 const Staff = require('../models/staff.model');
 const Submission = require('../models/submission.model');
@@ -8,6 +9,26 @@ const admin = require('../firebaseAdmin');
 const multer = require('multer');
 const archiver = require('archiver');
 const { Readable } = require('stream');
+
+// Helper function to get school and semester by semesterId (classId)
+async function getSchoolAndSemester(classId) {
+  const school = await School.findOne({ 'programs.semesters._id': classId });
+  if (!school) return null;
+
+  let semester;
+  let programIndex, semesterIndex;
+  for (programIndex = 0; programIndex < school.programs.length; programIndex++) {
+    const program = school.programs[programIndex];
+    semesterIndex = program.semesters.findIndex(s => s._id.toString() === classId.toString());
+    if (semesterIndex !== -1) {
+      semester = program.semesters[semesterIndex];
+      break;
+    }
+  }
+
+  if (!semester) return null;
+  return { school, semester, programIndex, semesterIndex };
+}
 
 // Configure multer for memory storage
 const storage = multer.memoryStorage();
@@ -61,9 +82,46 @@ const handleMulterError = (err, req, res, next) => {
   next(err);
 };
 
+// Get all exams
+exports.getAllExams = async (req, res) => {
+  try {
+    const exams = await Exam.find({}).lean();
+    res.json(exams);
+  } catch (error) {
+    console.error('Error fetching exams:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
+
+// Get exam by ID
+exports.getExamById = async (req, res) => {
+  const { examId } = req.params;
+  try {
+    const exam = await Exam.findById(examId).lean();
+    if (!exam) return res.status(404).json({ error: 'Exam not found' });
+    res.json(exam);
+  } catch (error) {
+    console.error('Error fetching exam:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
+
+// Get exam questions
+exports.getExamQuestions = async (req, res) => {
+  const { examId } = req.params;
+  try {
+    const exam = await Exam.findById(examId).select('questions').lean();
+    if (!exam) return res.status(404).json({ error: 'Exam not found' });
+    res.json(exam.questions);
+  } catch (error) {
+    console.error('Error fetching exam questions:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
+
 // Create a new exam
 exports.createExam = [upload, handleMulterError, async (req, res) => {
-  const { title, class: classId, description, startDate, endDate, duration, uploadDuration, questions } = req.body;
+  const { title, class: classId, startDate, endDate, duration, uploadDuration, questions } = req.body;
 
   try {
     let parsedQuestions = [];
@@ -134,7 +192,6 @@ exports.createExam = [upload, handleMulterError, async (req, res) => {
     const exam = new Exam({
       title,
       class: classId,
-      description,
       startDate: new Date(startDate),
       endDate: new Date(endDate),
       duration: parseInt(duration),
@@ -144,21 +201,23 @@ exports.createExam = [upload, handleMulterError, async (req, res) => {
     await exam.save();
     console.log('Exam saved to MongoDB:', exam._id);
 
-    // Add to class
-    const classDoc = await Class.findById(classId);
-    if (classDoc) {
-      classDoc.exams.push(exam._id);
-      await classDoc.save();
-      console.log('Exam added to class:', classId);
+    // Add to semester (class)
+    const result = await getSchoolAndSemester(classId);
+    if (!result) {
+      return res.status(404).json({ error: 'Class not found' });
+    }
+    const { school, semester } = result;
+    semester.exams.push(exam._id);
+    await school.save();
+    console.log('Exam added to class:', classId);
 
-      // Add to students
-      if (classDoc.students && classDoc.students.length > 0) {
-        const students = await Student.find({ _id: { $in: classDoc.students } });
-        for (const student of students) {
-          student.exams.push(exam._id);
-          await student.save();
-          console.log('Exam added to student:', student.uid);
-        }
+    // Add to students
+    if (semester.students && semester.students.length > 0) {
+      const students = await Student.find({ _id: { $in: semester.students } });
+      for (const student of students) {
+        student.exams.push(exam._id);
+        await student.save();
+        console.log('Exam added to student:', student.uid);
       }
     }
 
@@ -184,14 +243,16 @@ exports.createExam = [upload, handleMulterError, async (req, res) => {
 // Update an exam
 exports.updateExam = [upload, handleMulterError, async (req, res) => {
   const { id } = req.params;
-  const { title, class: classId, description, startDate, endDate, duration, uploadDuration, questions } = req.body;
+  const { title, class: classId, startDate, endDate, duration, uploadDuration, questions } = req.body;
 
   try {
-    const oldExam = await Exam.findById(id).populate('class');
+    const oldExam = await Exam.findById(id);
     if (!oldExam) {
       console.log('Exam not found for ID:', id);
       return res.status(404).json({ error: 'Exam not found' });
     }
+
+    const oldClassId = oldExam.class.toString();
 
     let parsedQuestions = [];
     try {
@@ -237,7 +298,6 @@ exports.updateExam = [upload, handleMulterError, async (req, res) => {
           blobStream.on('finish', async () => {
             await blob.makePublic();
             const url = `https://storage.googleapis.com/${bucket.name}/${filename}`;
-            console.log('File uploaded to Firebase:', url);
             resolve({ index: parseInt(index), url, fileType: file.mimetype });
           });
           blobStream.end(file.buffer);
@@ -253,108 +313,61 @@ exports.updateExam = [upload, handleMulterError, async (req, res) => {
       });
     }
 
-    const oldFileUrls = oldExam.questions
-      .filter(q => q.type === 'file' && q.fileUrl)
-      .map(q => q.fileUrl);
-    const newFileUrls = parsedQuestions
-      .filter(q => q.type === 'file' && q.fileUrl)
-      .map(q => q.fileUrl);
-    const deletedFileUrls = oldFileUrls.filter(url => !newFileUrls.includes(url));
+    // Update exam fields
+    oldExam.title = title;
+    oldExam.class = classId;
+    oldExam.startDate = new Date(startDate);
+    oldExam.endDate = new Date(endDate);
+    oldExam.duration = parseInt(duration);
+    oldExam.uploadDuration = parseInt(uploadDuration);
+    oldExam.questions = parsedQuestions;
+    await oldExam.save();
 
-    if (deletedFileUrls.length > 0) {
-      try {
-        const deletePromises = deletedFileUrls.map(async (url) => {
-          const filePath = url.split(`${bucket.name}/`)[1];
-          if (filePath) {
-            console.log(`Deleting file from Firebase: ${filePath}`);
-            await bucket.file(filePath).delete();
-          }
-        });
-        await Promise.all(deletePromises);
-      } catch (err) {
-        console.warn(`Failed to delete some files for exam ${id}:`, err.message);
-      }
+    // Handle class change
+    const newResult = await getSchoolAndSemester(classId);
+    if (!newResult) {
+      return res.status(404).json({ error: 'Class not found' });
     }
+    const { school: newSchool, semester: newSemester } = newResult;
 
-    const updatedExam = await Exam.findByIdAndUpdate(
-      id,
-      {
-        title,
-        class: classId,
-        description,
-        startDate,
-        endDate,
-        duration: parseInt(duration),
-        uploadDuration: parseInt(uploadDuration),
-        questions: parsedQuestions
-      },
-      { new: true }
-    ).populate('class', 'name');
+    if (oldClassId !== classId) {
+      // Remove from old semester
+      const oldResult = await getSchoolAndSemester(oldClassId);
+      if (oldResult) {
+        const { school: oldSchool, semester: oldSemester } = oldResult;
+        oldSemester.exams = oldSemester.exams.filter(e => e.toString() !== id);
+        await oldSchool.save();
 
-    if (!updatedExam) {
-      console.log('Exam not found for ID:', id);
-      return res.status(404).json({ error: 'Exam not found' });
-    }
-
-    const oldClassId = oldExam.class?._id.toString();
-    const newClassId = classId;
-    if (oldClassId && newClassId && oldClassId !== newClassId) {
-      const oldClassDoc = await Class.findById(oldClassId);
-      if (oldClassDoc) {
-        oldClassDoc.exams.pull(id);
-        await oldClassDoc.save();
-        console.log('Exam removed from old class:', oldClassId);
-        const oldStudents = await Student.find({ _id: { $in: oldClassDoc.students } });
+        // Remove from old students
+        const oldStudents = await Student.find({ _id: { $in: oldSemester.students } });
         for (const student of oldStudents) {
-          student.exams.pull(id);
+          student.exams = student.exams.filter(e => e.toString() !== id);
           await student.save();
-          console.log('Exam removed from old student:', student.uid);
         }
       }
-      const newClassDoc = await Class.findById(newClassId);
-      if (newClassDoc) {
-        if (!newClassDoc.exams.includes(id)) {
-          newClassDoc.exams.push(id);
-          await newClassDoc.save();
-          console.log('Exam added to new class:', newClassId);
-        }
-        if (newClassDoc.students && newClassDoc.students.length > 0) {
-          const newStudents = await Student.find({ _id: { $in: newClassDoc.students } });
-          for (const student of newStudents) {
-            if (!student.exams.includes(id)) {
-              student.exams.push(id);
-              await student.save();
-              console.log('Exam added to new student:', student.uid);
-            }
-          }
+
+      // Add to new semester
+      newSemester.exams.push(id);
+      await newSchool.save();
+
+      // Add to new students
+      const newStudents = await Student.find({ _id: { $in: newSemester.students } });
+      for (const student of newStudents) {
+        if (!student.exams.some(e => e.toString() === id)) {
+          student.exams.push(id);
+          await student.save();
         }
       }
-    } else if (newClassId) {
-      const currentClassDoc = await Class.findById(newClassId);
-      if (currentClassDoc && currentClassDoc.students && currentClassDoc.students.length > 0) {
-        const currentStudents = await Student.find({ _id: { $in: currentClassDoc.students } });
-        for (const student of currentStudents) {
-          if (!student.exams.includes(id)) {
-            student.exams.push(id);
-            await student.save();
-            console.log('Exam added to existing student:', student.uid);
-          }
-        }
+    } else {
+      // If same class, ensure added (though should be)
+      if (!newSemester.exams.some(e => e.toString() === id)) {
+        newSemester.exams.push(id);
+        await newSchool.save();
       }
     }
 
-    // Ensure all staff have this exam
-    const staffs = await Staff.find({});
-    for (const staff of staffs) {
-      if (!staff.exams.includes(id)) {
-        staff.exams.push(id);
-        await staff.save();
-        console.log('Exam added to staff:', staff.uid);
-      }
-    }
 
-    console.log('Exam updated in MongoDB:', updatedExam._id);
-    res.json(updatedExam);
+    res.json(oldExam);
   } catch (error) {
     console.error('Error updating exam:', error);
     if (error.name === 'ValidationError') {
@@ -368,331 +381,92 @@ exports.updateExam = [upload, handleMulterError, async (req, res) => {
 // Delete an exam
 exports.deleteExam = async (req, res) => {
   const { id } = req.params;
-
   try {
-    const examDoc = await Exam.findById(id).populate('class');
-    if (!examDoc) {
-      console.log('Exam not found for ID:', id);
-      return res.status(404).json({ error: 'Exam not found' });
+    const exam = await Exam.findById(id);
+    if (!exam) return res.status(404).json({ error: 'Exam not found' });
+
+    const classId = exam.class.toString();
+
+    // Remove from semester
+    const result = await getSchoolAndSemester(classId);
+    if (result) {
+      const { school, semester } = result;
+      semester.exams = semester.exams.filter(e => e.toString() !== id);
+      await school.save();
     }
 
-    await Exam.findByIdAndDelete(id);
-    console.log('Exam deleted from MongoDB:', id);
-
-    // Remove from class
-    if (examDoc.class) {
-      const classDoc = await Class.findById(examDoc.class._id);
-      if (classDoc) {
-        classDoc.exams.pull(id);
-        await classDoc.save();
-        console.log('Exam removed from class:', examDoc.class._id);
-      }
-      if (classDoc.students && classDoc.students.length > 0) {
-        const students = await Student.find({ _id: { $in: classDoc.students } });
-        for (const student of students) {
-          student.exams.pull(id);
-          await student.save();
-          console.log('Exam removed from student:', student.uid);
-        }
-      }
+    // Remove from students (all who have it)
+    const students = await Student.find({ exams: id });
+    for (const student of students) {
+      student.exams.pull(id);
+      await student.save();
     }
 
-    // Remove from all staff
-    const staffs = await Staff.find({});
+    // Remove from staff
+    const staffs = await Staff.find({ exams: id });
     for (const staff of staffs) {
       staff.exams.pull(id);
       await staff.save();
-      console.log('Exam removed from staff:', staff.uid);
     }
 
-    console.log('Exam deleted from MongoDB:', id);
+    // Delete submissions and reports
+    await Submission.deleteMany({ examId: id });
+    await ExamReport.deleteMany({ examId: id });
+
+    // Delete exam
+    await Exam.findByIdAndDelete(id);
+
     res.json({ message: 'Exam deleted successfully' });
   } catch (error) {
-    console.error('Error deleting exam:', error.message);
-    res.status(500).json({ error: `Server error: ${error.message}` });
-  }
-};
-
-// Upload exam report PDF
-exports.uploadExamReport = [
-  uploadReportFile,
-  handleMulterError,
-  async (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No PDF file uploaded' });
-    }
-
-    const { examId, uid, violations, totalViolations, examStartTime, examEndTime, wordCounts, userAnswers } = req.body;
-
-    try {
-      const student = await Student.findOne({ uid });
-      if (!student) {
-        return res.status(404).json({ error: 'Student not found' });
-      }
-
-      const exam = await Exam.findById(examId);
-      if (!exam) {
-        return res.status(404).json({ error: 'Exam not found' });
-      }
-
-      // Check if exam report already exists
-      const existingReport = await ExamReport.findOne({ examId, uid });
-      if (existingReport && existingReport.completed) {
-        return res.status(403).json({ error: 'Exam already completed' });
-      }
-
-      const filename = `exam-reports/${examId}/${uid}/${Date.now()}-exam-report.pdf`;
-      const blob = bucket.file(filename);
-      const blobStream = blob.createWriteStream({
-        metadata: { contentType: req.file.mimetype }
-      });
-
-      blobStream.on('error', (err) => {
-        console.error('Upload stream error:', err);
-        res.status(500).json({ error: 'Failed to upload report' });
-      });
-
-      blobStream.on('finish', async () => {
-        await blob.makePublic();
-        const reportUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
-        console.log('Exam report uploaded to Firebase:', reportUrl);
-
-        // Save or update the report
-        const report = existingReport || new ExamReport({
-          examId,
-          uid,
-          studentId: student._id,
-          reportUrl,
-          violations: JSON.parse(violations || '{}'),
-          totalViolations: parseInt(totalViolations || 0),
-          examStartTime: new Date(examStartTime),
-          examEndTime: new Date(examEndTime),
-          wordCounts: JSON.parse(wordCounts || '{}'),
-          userAnswers: JSON.parse(userAnswers || '{}'),
-          completed: true,
-        });
-
-        if (existingReport) {
-          existingReport.reportUrl = reportUrl;
-          existingReport.violations = JSON.parse(violations || '{}');
-          existingReport.totalViolations = parseInt(totalViolations || 0);
-          existingReport.examStartTime = new Date(examStartTime);
-          existingReport.examEndTime = new Date(examEndTime);
-          existingReport.wordCounts = JSON.parse(wordCounts || '{}');
-          existingReport.userAnswers = JSON.parse(userAnswers || '{}');
-          existingReport.completed = true;
-          await existingReport.save();
-          console.log('Exam report updated in MongoDB:', existingReport._id);
-        } else {
-          await report.save();
-          console.log('Exam report saved to MongoDB:', report._id);
-        }
-
-        res.json({ reportUrl, message: 'Report uploaded successfully' });
-      });
-
-      blobStream.end(req.file.buffer);
-    } catch (error) {
-      console.error('Error uploading exam report:', error);
-      res.status(500).json({ error: 'Failed to upload report' });
-    }
-  }
-];
-
-// Get exam report for a student
-exports.getExamReport = async (req, res) => {
-  const { examId, uid } = req.params;
-  try {
-    console.log(`Fetching exam report for exam ID: ${examId}, UID: ${uid}`);
-    const report = await ExamReport.findOne({ examId, uid })
-      .populate('examId', 'title startDate')
-      .populate('studentId', 'name email');
-    if (!report) {
-      console.log(`No report found for exam ID: ${examId}, UID: ${uid}`);
-      return res.status(404).json({ error: 'No report found' });
-    }
-    console.log('Exam report fetched:', report._id);
-    res.json(report);
-  } catch (error) {
-    console.error(`Error fetching exam report:`, error.message);
-    res.status(500).json({ error: `Server error: ${error.message}` });
-  }
-};
-
-// Get all reports for an exam (for admin overview)
-exports.getExamReports = async (req, res) => {
-  const { examId } = req.params;
-  try {
-    console.log(`Fetching all reports for exam ID: ${examId}`);
-    const reports = await ExamReport.find({ examId })
-      .populate('studentId', 'name email uid')
-      .sort({ generatedAt: -1 });
-    res.json(reports);
-  } catch (error) {
-    console.error(`Error fetching exam reports:`, error.message);
-    res.status(500).json({ error: `Server error: ${error.message}` });
-  }
-};
-
-// Get exam details by ID
-exports.getExamById = async (req, res) => {
-  const { examId } = req.params;
-  const { uid } = req.query;
-  try {
-    console.log(`Fetching exam details for exam ID: ${examId}, UID: ${uid}`);
-    const exam = await Exam.findById(examId).populate('class', 'name');
-    if (!exam) {
-      console.log(`Exam not found for ID: ${examId}`);
-      return res.status(404).json({ error: 'Exam not found' });
-    }
-
-    const currentTime = new Date();
-    const endTime = new Date(exam.endDate);
-    const isExamOver = currentTime > endTime;
-
-    let report = null;
-    let completed = false;
-    let attended = false;
-
-    if (uid) {
-      report = await ExamReport.findOne({ examId, uid });
-      completed = report ? report.completed : false;
-      attended = !!report; // If a report exists, the student attended
-    }
-
-    console.log(`Exam details fetched for exam ID: ${examId}`);
-    res.json({
-      ...exam.toObject(),
-      isExamOver,
-      completed,
-      attended,
-    });
-  } catch (error) {
-    console.error(`Error fetching exam details for exam ID: ${examId}:`, error.message);
-    res.status(500).json({ error: `Server error: ${error.message}` });
-  }
-};
-
-// Get all exams
-exports.getAllExams = async (req, res) => {
-  try {
-    console.log('Fetching all exams...', req.query);
-    if (req.query.uid) {
-      console.log('Fetching exams for student UID:', req.query.uid);
-      const student = await Student.findOne({ uid: req.query.uid })
-        .populate({
-          path: 'exams',
-          populate: { path: 'class', select: 'name' }
-        });
-      if (!student) {
-        console.log('Student not found for UID:', req.query.uid);
-        return res.status(404).json({ error: 'Student not found' });
-      }
-
-      const currentTime = new Date();
-      const examsWithStatus = await Promise.all(
-        student.exams.map(async (exam) => {
-          const report = await ExamReport.findOne({ examId: exam._id, uid: req.query.uid });
-          const endTime = new Date(exam.endDate);
-          return {
-            ...exam.toObject(),
-            completed: report ? report.completed : false,
-            attended: !!report,
-            isExamOver: currentTime > endTime,
-          };
-        })
-      );
-
-      console.log('Student exams fetched:', examsWithStatus.length);
-      res.json(examsWithStatus);
-    } else {
-      const exams = await Exam.find({})
-        .populate('class', 'name');
-      console.log('Exams fetched:', exams.length);
-      res.json(exams);
-    }
-  } catch (error) {
-    console.error('Error fetching exams:', error.message);
-    res.status(500).json({ error: `Server error: ${error.message}` });
-  }
-};
-
-// Get exam questions
-exports.getExamQuestions = async (req, res) => {
-  const { examId } = req.params;
-  const { uid } = req.query;
-  try {
-    console.log(`Fetching questions for exam ID: ${examId}, UID: ${uid}`);
-    const exam = await Exam.findById(examId).select('questions');
-    if (!exam) {
-      console.log(`Exam not found for ID: ${examId}`);
-      return res.status(404).json({ error: 'Exam not found' });
-    }
-    res.json(exam.questions);
-  } catch (error) {
-    console.error(`Error fetching questions for exam ID: ${examId}:`, error.message);
-    res.status(500).json({ error: `Server error: ${error.message}` });
+    console.error('Error deleting exam:', error);
+    res.status(500).json({ error: 'Server error' });
   }
 };
 
 // Upload student file
-exports.uploadStudentFile = [
-  uploadStudentFile,
-  handleMulterError,
-  async (req, res) => {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
+exports.uploadStudentFile = [uploadStudentFile, handleMulterError, async (req, res) => {
+  const { examId, questionId, uid } = req.body;
+  try {
+    const student = await Student.findOne({ uid });
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
     }
 
-    const { examId, questionId, uid } = req.body;
+    const filename = `student-submissions/${examId}/${uid}/${Date.now()}-${req.file.originalname}`;
+    const blob = bucket.file(filename);
+    const blobStream = blob.createWriteStream({
+      metadata: { contentType: req.file.mimetype }
+    });
 
-    try {
-      const student = await Student.findOne({ uid });
-      if (!student) {
-        return res.status(404).json({ error: 'Student not found' });
-      }
-
-      const exam = await Exam.findById(examId);
-      if (!exam) {
-        return res.status(404).json({ error: 'Exam not found' });
-      }
-
-      const filename = `student-submissions/${uid}/${examId}/${questionId}/${Date.now()}-${req.file.originalname}`;
-      const blob = bucket.file(filename);
-      const blobStream = blob.createWriteStream({
-        metadata: { contentType: req.file.mimetype }
-      });
-
-      blobStream.on('error', (err) => {
-        console.error('Upload stream error:', err);
-        res.status(500).json({ error: 'Failed to upload file' });
-      });
-
-      blobStream.on('finish', async () => {
-        await blob.makePublic();
-        const fileUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
-        console.log('Student file uploaded to Firebase:', fileUrl);
-
-        const submission = new Submission({
-          examId,
-          questionId,
-          uid,
-          studentId: student._id,
-          fileUrl
-        });
-        await submission.save();
-        console.log('Submission saved to MongoDB:', submission._id);
-
-        res.json({ fileUrl });
-      });
-
-      blobStream.end(req.file.buffer);
-    } catch (error) {
-      console.error('Error uploading student file:', error);
+    blobStream.on('error', (err) => {
+      console.error('Upload stream error:', err);
       res.status(500).json({ error: 'Failed to upload file' });
-    }
+    });
+
+    blobStream.on('finish', async () => {
+      await blob.makePublic();
+      const fileUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
+      console.log('Student file uploaded to Firebase:', fileUrl);
+
+      const submission = new Submission({
+        examId,
+        questionId,
+        uid,
+        studentId: student._id,
+        fileUrl
+      });
+      await submission.save();
+      console.log('Submission saved to MongoDB:', submission._id);
+
+      res.json({ fileUrl });
+    });
+
+    blobStream.end(req.file.buffer);
+  } catch (error) {
+    console.error('Error uploading student file:', error);
+    res.status(500).json({ error: 'Failed to upload file' });
   }
-];
+}];
 
 // Get student submissions
 exports.getStudentSubmissions = async (req, res) => {
@@ -733,35 +507,35 @@ exports.getStudentsByExamSubmissions = async (req, res) => {
   const { examId } = req.params;
   try {
     console.log(`Fetching students for exam ID: ${examId}`);
-    const exam = await Exam.findById(examId).populate('class', 'students');
+    const exam = await Exam.findById(examId);
     if (!exam) {
       console.log(`Exam not found for ID: ${examId}`);
       return res.status(404).json({ error: 'Exam not found' });
     }
 
-    const classId = exam.class?._id;
-    if (!classId) {
+    const classId = exam.class.toString();
+    const result = await getSchoolAndSemester(classId);
+    if (!result) {
       console.log(`No class associated with exam ID: ${examId}`);
       return res.status(404).json({ error: 'No class associated with this exam' });
     }
+    const { semester } = result;
 
-    const students = await Student.find({ _id: { $in: exam.class.students } })
+    const students = await Student.find({ _id: { $in: semester.students } })
       .select('email uid')
       .lean();
 
-    const submissions = await Submission.find({ examId })
-      .select('studentId')
-      .lean();
-
-    const studentsWithSubmissions = new Set(
-      submissions.map((submission) => submission.studentId.toString())
-    );
+    const reports = await ExamReport.find({ examId }).lean();
+    const reportsByUid = reports.reduce((acc, report) => {
+      acc[report.uid] = report;
+      return acc;
+    }, {});
 
     const studentsWithAttendance = students.map((student) => ({
       _id: student._id,
       email: student.email,
       uid: student.uid,
-      attended: studentsWithSubmissions.has(student._id.toString()),
+      attended: !!reportsByUid[student.uid]?.completed, 
     }));
 
     console.log(`Found ${studentsWithAttendance.length} students for exam ID: ${examId}`);
@@ -823,7 +597,7 @@ exports.downloadAllSubmissions = async (req, res) => {
         archive.append(Readable.from(fileBuffer), { name: fileName });
         console.log(`Added file to ZIP: ${fileName}`);
       } catch (err) {
-        console.warn(`Failed to download file ${fileUrl}: ${err.message}`);
+        console.warn(`Failed to download file ${fileUrl}:`, err.message);
       }
     }
 
@@ -886,7 +660,7 @@ exports.downloadAllReports = async (req, res) => {
         archive.append(Readable.from(fileBuffer), { name: fileName });
         console.log(`Added report to ZIP: ${fileName}`);
       } catch (err) {
-        console.warn(`Failed to download report ${fileUrl}: ${err.message}`);
+        console.warn(`Failed to download report ${fileUrl}:`, err.message);
       }
     }
 
@@ -895,6 +669,73 @@ exports.downloadAllReports = async (req, res) => {
   } catch (error) {
     console.error(`Error downloading reports for exam ID: ${examId}:`, error.message);
     res.status(500).json({ error: `Server error: ${error.message}` });
+  }
+};
+
+// Upload exam report (assuming implementation based on context)
+exports.uploadExamReport = [uploadReportFile, handleMulterError, async (req, res) => {
+  const { examId } = req.params;
+  const { uid } = req.body; // Assuming uid is sent in body
+  try {
+    const student = await Student.findOne({ uid });
+    if (!student) return res.status(404).json({ error: 'Student not found' });
+
+    const filename = `exam-reports/${examId}/${uid}/${Date.now()}-${req.file.originalname}`;
+    const blob = bucket.file(filename);
+    const blobStream = blob.createWriteStream({
+      metadata: { contentType: req.file.mimetype }
+    });
+
+    blobStream.on('error', (err) => {
+      console.error('Upload error:', err);
+      res.status(500).json({ error: 'Failed to upload report' });
+    });
+
+    blobStream.on('finish', async () => {
+      await blob.makePublic();
+      const reportUrl = `https://storage.googleapis.com/${bucket.name}/${filename}`;
+
+      const examReport = new ExamReport({
+        examId,
+        uid,
+        studentId: student._id,
+        reportUrl,
+        completed: true 
+      });
+      await examReport.save();
+
+      res.json({ reportUrl });
+    });
+
+    blobStream.end(req.file.buffer);
+  } catch (error) {
+    console.error('Error uploading report:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+}];
+
+// Get exam report
+exports.getExamReport = async (req, res) => {
+  const { examId, uid } = req.params;
+  try {
+    const report = await ExamReport.findOne({ examId, uid }).lean();
+    if (!report) return res.status(404).json({ error: 'Report not found' });
+    res.json(report);
+  } catch (error) {
+    console.error('Error fetching report:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
+
+// Get all exam reports
+exports.getExamReports = async (req, res) => {
+  const { examId } = req.params;
+  try {
+    const reports = await ExamReport.find({ examId }).lean();
+    res.json(reports);
+  } catch (error) {
+    console.error('Error fetching reports:', error);
+    res.status(500).json({ error: 'Server error' });
   }
 };
 
