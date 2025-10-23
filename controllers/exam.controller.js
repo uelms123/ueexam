@@ -5,6 +5,7 @@ const Student = require('../models/student.model');
 const Staff = require('../models/staff.model');
 const Submission = require('../models/submission.model');
 const ExamReport = require('../models/examReport.model');
+const SavedAnswer = require('../models/savedAnswer.model'); // Add new model
 const admin = require('../firebaseAdmin');
 const multer = require('multer');
 const archiver = require('archiver');
@@ -738,5 +739,90 @@ exports.getExamReports = async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 };
+
+
+// Save student answers
+exports.saveAnswers = async (req, res) => {
+  const { examId } = req.params;
+  const { uid, userAnswers, uploadedFileUrls } = req.body;
+
+  try {
+    const student = await Student.findOne({ uid });
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const exam = await Exam.findById(examId);
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    if (!student.exams.some(id => id.toString() === examId)) {
+      return res.status(403).json({ error: 'Student not enrolled in this exam' });
+    }
+
+    // Validate answers against exam questions
+    const validQuestionIds = exam.questions.map(q => q._id.toString());
+    for (const questionId of Object.keys(userAnswers)) {
+      if (!validQuestionIds.includes(questionId)) {
+        return res.status(400).json({ error: `Invalid question ID: ${questionId}` });
+      }
+    }
+    for (const questionId of Object.keys(uploadedFileUrls)) {
+      if (!validQuestionIds.includes(questionId)) {
+        return res.status(400).json({ error: `Invalid question ID for file URL: ${questionId}` });
+      }
+    }
+
+    // Update or create saved answers
+    const savedAnswer = await SavedAnswer.findOneAndUpdate(
+      { examId, uid },
+      { userAnswers, uploadedFileUrls },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    console.log(`Answers saved for exam ID: ${examId}, UID: ${uid}`);
+    res.json({ message: 'Answers saved successfully', savedAnswer });
+  } catch (error) {
+    console.error('Error saving answers:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
+
+// Get saved answers
+exports.getSavedAnswers = async (req, res) => {
+  const { examId, uid } = req.params;
+
+  try {
+    const student = await Student.findOne({ uid });
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const exam = await Exam.findById(examId);
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    if (!student.exams.some(id => id.toString() === examId)) {
+      return res.status(403).json({ error: 'Student not enrolled in this exam' });
+    }
+
+    const savedAnswer = await SavedAnswer.findOne({ examId, uid }).lean();
+    if (!savedAnswer) {
+      return res.json({ userAnswers: {}, uploadedFileUrls: {} }); // Return empty if no saved answers
+    }
+
+    console.log(`Fetched saved answers for exam ID: ${examId}, UID: ${uid}`);
+    res.json({
+      userAnswers: savedAnswer.userAnswers || {},
+      uploadedFileUrls: savedAnswer.uploadedFileUrls || {},
+    });
+  } catch (error) {
+    console.error('Error fetching saved answers:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
+
 
 exports.upload = upload;
