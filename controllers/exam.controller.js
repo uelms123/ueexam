@@ -1,10 +1,10 @@
-// exam.controller.js
 const Exam = require('../models/exam.model');
 const School = require('../models/school.model');
 const Student = require('../models/student.model');
 const Staff = require('../models/staff.model');
 const Submission = require('../models/submission.model');
 const ExamReport = require('../models/examReport.model');
+const SavedAnswer = require('../models/savedAnswer.model'); // Add new model
 const admin = require('../firebaseAdmin');
 const multer = require('multer');
 const archiver = require('archiver');
@@ -85,8 +85,30 @@ const handleMulterError = (err, req, res, next) => {
 // Get all exams
 exports.getAllExams = async (req, res) => {
   try {
-    const exams = await Exam.find({}).lean();
-    res.json(exams);
+    const { uid } = req.query;
+    if (!uid) {
+      return res.status(400).json({ error: 'User ID (uid) is required' });
+    }
+    
+    const student = await Student.findOne({ uid });
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const exams = await Exam.find({ _id: { $in: student.exams } }).lean();
+    
+    // Check for completed exams
+    const reports = await ExamReport.find({ uid, examId: { $in: exams.map(e => e._id) } }).lean();
+    const completedExamIds = new Set(reports.map(r => r.examId.toString()));
+    
+    const now = new Date();
+    const examsWithStatus = exams.map(exam => ({
+      ...exam,
+      completed: completedExamIds.has(exam._id.toString()),
+      isExamOver: new Date(exam.endDate) < now,
+    }));
+
+    res.json(examsWithStatus);
   } catch (error) {
     console.error('Error fetching exams:', error);
     res.status(500).json({ error: 'Server error' });
@@ -96,10 +118,27 @@ exports.getAllExams = async (req, res) => {
 // Get exam by ID
 exports.getExamById = async (req, res) => {
   const { examId } = req.params;
+  const { uid } = req.query;
   try {
     const exam = await Exam.findById(examId).lean();
     if (!exam) return res.status(404).json({ error: 'Exam not found' });
-    res.json(exam);
+
+    const student = await Student.findOne({ uid });
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    if (!student.exams.some(id => id.toString() === examId)) {
+      return res.status(403).json({ error: 'Student not enrolled in this exam' });
+    }
+
+    const report = await ExamReport.findOne({ examId, uid }).lean();
+    const now = new Date();
+    res.json({
+      ...exam,
+      completed: !!report?.completed,
+      isExamOver: new Date(exam.endDate) < now,
+    });
   } catch (error) {
     console.error('Error fetching exam:', error);
     res.status(500).json({ error: 'Server error' });
@@ -109,9 +148,20 @@ exports.getExamById = async (req, res) => {
 // Get exam questions
 exports.getExamQuestions = async (req, res) => {
   const { examId } = req.params;
+  const { uid } = req.query;
   try {
     const exam = await Exam.findById(examId).select('questions').lean();
     if (!exam) return res.status(404).json({ error: 'Exam not found' });
+
+    const student = await Student.findOne({ uid });
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    if (!student.exams.some(id => id.toString() === examId)) {
+      return res.status(403).json({ error: 'Student not enrolled in this exam' });
+    }
+
     res.json(exam.questions);
   } catch (error) {
     console.error('Error fetching exam questions:', error);
@@ -359,13 +409,12 @@ exports.updateExam = [upload, handleMulterError, async (req, res) => {
         }
       }
     } else {
-      // If same class, ensure added (though should be)
+      // If same class, ensure added
       if (!newSemester.exams.some(e => e.toString() === id)) {
         newSemester.exams.push(id);
         await newSchool.save();
       }
     }
-
 
     res.json(oldExam);
   } catch (error) {
@@ -395,7 +444,7 @@ exports.deleteExam = async (req, res) => {
       await school.save();
     }
 
-    // Remove from students (all who have it)
+    // Remove from students
     const students = await Student.find({ exams: id });
     for (const student of students) {
       student.exams.pull(id);
@@ -409,9 +458,10 @@ exports.deleteExam = async (req, res) => {
       await staff.save();
     }
 
-    // Delete submissions and reports
+    // Delete submissions, reports, and saved answers
     await Submission.deleteMany({ examId: id });
     await ExamReport.deleteMany({ examId: id });
+    await SavedAnswer.deleteMany({ examId: id });
 
     // Delete exam
     await Exam.findByIdAndDelete(id);
@@ -430,6 +480,15 @@ exports.uploadStudentFile = [uploadStudentFile, handleMulterError, async (req, r
     const student = await Student.findOne({ uid });
     if (!student) {
       return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const exam = await Exam.findById(examId);
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    if (!exam.questions.some(q => q._id.toString() === questionId)) {
+      return res.status(400).json({ error: 'Question not found in exam' });
     }
 
     const filename = `student-submissions/${examId}/${uid}/${Date.now()}-${req.file.originalname}`;
@@ -467,6 +526,89 @@ exports.uploadStudentFile = [uploadStudentFile, handleMulterError, async (req, r
     res.status(500).json({ error: 'Failed to upload file' });
   }
 }];
+
+// Save student answers
+exports.saveAnswers = async (req, res) => {
+  const { examId } = req.params;
+  const { uid, userAnswers, uploadedFileUrls } = req.body;
+
+  try {
+    const student = await Student.findOne({ uid });
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const exam = await Exam.findById(examId);
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    if (!student.exams.some(id => id.toString() === examId)) {
+      return res.status(403).json({ error: 'Student not enrolled in this exam' });
+    }
+
+    // Validate answers against exam questions
+    const validQuestionIds = exam.questions.map(q => q._id.toString());
+    for (const questionId of Object.keys(userAnswers)) {
+      if (!validQuestionIds.includes(questionId)) {
+        return res.status(400).json({ error: `Invalid question ID: ${questionId}` });
+      }
+    }
+    for (const questionId of Object.keys(uploadedFileUrls)) {
+      if (!validQuestionIds.includes(questionId)) {
+        return res.status(400).json({ error: `Invalid question ID for file URL: ${questionId}` });
+      }
+    }
+
+    // Update or create saved answers
+    const savedAnswer = await SavedAnswer.findOneAndUpdate(
+      { examId, uid },
+      { userAnswers, uploadedFileUrls },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    console.log(`Answers saved for exam ID: ${examId}, UID: ${uid}`);
+    res.json({ message: 'Answers saved successfully', savedAnswer });
+  } catch (error) {
+    console.error('Error saving answers:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
+
+// Get saved answers
+exports.getSavedAnswers = async (req, res) => {
+  const { examId, uid } = req.params;
+
+  try {
+    const student = await Student.findOne({ uid });
+    if (!student) {
+      return res.status(404).json({ error: 'Student not found' });
+    }
+
+    const exam = await Exam.findById(examId);
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    if (!student.exams.some(id => id.toString() === examId)) {
+      return res.status(403).json({ error: 'Student not enrolled in this exam' });
+    }
+
+    const savedAnswer = await SavedAnswer.findOne({ examId, uid }).lean();
+    if (!savedAnswer) {
+      return res.json({ userAnswers: {}, uploadedFileUrls: {} }); // Return empty if no saved answers
+    }
+
+    console.log(`Fetched saved answers for exam ID: ${examId}, UID: ${uid}`);
+    res.json({
+      userAnswers: savedAnswer.userAnswers || {},
+      uploadedFileUrls: savedAnswer.uploadedFileUrls || {},
+    });
+  } catch (error) {
+    console.error('Error fetching saved answers:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+};
 
 // Get student submissions
 exports.getStudentSubmissions = async (req, res) => {
@@ -672,13 +814,20 @@ exports.downloadAllReports = async (req, res) => {
   }
 };
 
-// Upload exam report (assuming implementation based on context)
+// Upload exam report
 exports.uploadExamReport = [uploadReportFile, handleMulterError, async (req, res) => {
   const { examId } = req.params;
-  const { uid } = req.body; // Assuming uid is sent in body
+  const { uid, violations, totalViolations, examStartTime, examEndTime, wordCounts, userAnswers, tabSwitchTimestamps } = req.body;
   try {
     const student = await Student.findOne({ uid });
     if (!student) return res.status(404).json({ error: 'Student not found' });
+
+    const exam = await Exam.findById(examId);
+    if (!exam) return res.status(404).json({ error: 'Exam not found' });
+
+    if (!student.exams.some(id => id.toString() === examId)) {
+      return res.status(403).json({ error: 'Student not enrolled in this exam' });
+    }
 
     const filename = `exam-reports/${examId}/${uid}/${Date.now()}-${req.file.originalname}`;
     const blob = bucket.file(filename);
@@ -700,9 +849,20 @@ exports.uploadExamReport = [uploadReportFile, handleMulterError, async (req, res
         uid,
         studentId: student._id,
         reportUrl,
+        violations: JSON.parse(violations),
+        totalViolations: parseInt(totalViolations),
+        examStartTime: new Date(examStartTime),
+        examEndTime: new Date(examEndTime),
+        wordCounts: JSON.parse(wordCounts),
+        userAnswers: JSON.parse(userAnswers),
+        tabSwitchTimestamps: JSON.parse(tabSwitchTimestamps),
         completed: true 
       });
       await examReport.save();
+      console.log('Exam report saved:', examReport._id);
+
+      // Delete saved answers after final submission
+      await SavedAnswer.deleteOne({ examId, uid });
 
       res.json({ reportUrl });
     });
