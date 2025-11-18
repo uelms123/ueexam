@@ -86,6 +86,8 @@ const handleMulterError = (err, req, res, next) => {
   next(err);
 };
 
+// Add this updated generateReportPDF function to your exam.controller.js
+
 // Generate PDF Report with University Logo and Student Info
 exports.generateReportPDF = async (req, res) => {
   const { examId } = req.params;
@@ -127,64 +129,107 @@ exports.generateReportPDF = async (req, res) => {
        .text(`Program: ${student.program || 'N/A'}`, 50, 180)
        .text(`Batch: ${student.batch || 'N/A'}`, 50, 200);
 
-    // Add exam information
+    // Add exam information header
     doc.fontSize(16).font('Helvetica-Bold')
        .text('Exam Proctoring Report', 50, 240);
-    
-    doc.fontSize(12).font('Helvetica')
-       .text(`Exam: ${exam.title || 'Unknown'}`, 50, 270)
-       .text(`Status: ${report?.completed ? 'Completed' : 'Incomplete'}`, 50, 290)
-       .text(`Start Time: ${report?.startTime || 'N/A'}`, 50, 310)
-       .text(`End Time: ${report?.endTime || 'N/A'}`, 50, 330);
 
-    // Add student answers section
+    // Add status and timing information exactly like in screenshot
+    doc.fontSize(12).font('Helvetica')
+       .text(`Status: ${report?.completed ? 'Completed' : 'In Progress'}`, 50, 270)
+       .text(`Start Time: ${report?.startTime || formatDate(new Date())}`, 50, 290)
+       .text(`End Time: ${report?.endTime || formatDate(new Date())}`, 50, 310);
+
+    // Add student answers section - exactly like in screenshot
     if (report?.userAnswers && Object.keys(report.userAnswers).length > 0) {
-      doc.addPage()
-         .fontSize(16).font('Helvetica-Bold')
-         .text('Student Answers:', 50, 50);
+      let yPosition = 350;
       
-      let yPosition = 80;
-      Object.entries(report.userAnswers).forEach(([question, answer], index) => {
+      doc.fontSize(14).font('Helvetica-Bold')
+         .text('Student Answers:', 50, yPosition);
+      
+      yPosition += 30;
+
+      // Get exam questions to match question IDs with actual questions
+      const examWithQuestions = await Exam.findById(examId).lean();
+      const questionsMap = {};
+      examWithQuestions.questions.forEach((q, index) => {
+        questionsMap[q._id.toString()] = {
+          text: q.description,
+          type: q.type,
+          index: index + 1
+        };
+      });
+
+      Object.entries(report.userAnswers).forEach(([questionId, answer]) => {
         if (yPosition > 700) {
           doc.addPage();
           yPosition = 50;
         }
-        
+
+        const questionInfo = questionsMap[questionId];
+        const questionNumber = questionInfo ? questionInfo.index : 'Unknown';
+        const questionText = questionInfo ? questionInfo.text : `Question ${questionId}`;
+        const questionType = questionInfo ? questionInfo.type : 'unknown';
+
+        // Question header
         doc.fontSize(12).font('Helvetica-Bold')
-           .text(`Q${index + 1}: ${question}`, 50, yPosition);
+           .text(`Q${questionNumber}: ${questionText}`, 50, yPosition);
         
-        doc.fontSize(10).font('Helvetica')
-           .text(`Answer: ${answer.selectedAnswer || answer.answer || 'No answer'}`, 70, yPosition + 20);
-        
-        if (answer.wordCount) {
-          doc.text(`Word Count: ${answer.wordCount}`, 70, yPosition + 40);
+        yPosition += 20;
+
+        // Answer content
+        if (questionType === 'mcq') {
+          doc.fontSize(10).font('Helvetica')
+             .text(`    Selected Answer: ${answer.selectedAnswer || answer.answer || 'No answer'}`, 70, yPosition);
+        } else {
+          doc.fontSize(10).font('Helvetica')
+             .text(`    Answer: ${answer.answer || answer.selectedAnswer || 'No answer'}`, 70, yPosition);
         }
         
-        yPosition += 70;
+        yPosition += 20;
+
+        // Word count if available
+        if (answer.wordCount) {
+          doc.fontSize(10).font('Helvetica')
+             .text(`    Word Count: ${answer.wordCount}`, 70, yPosition);
+          yPosition += 20;
+        }
+
+        // Add some spacing between questions
+        yPosition += 10;
       });
     } else {
-      doc.addPage()
-         .fontSize(12).font('Helvetica')
-         .text('No answers submitted.', 50, 50);
+      // No answers section
+      doc.fontSize(14).font('Helvetica-Bold')
+         .text('Student Answers:', 50, 350);
+      
+      doc.fontSize(12).font('Helvetica')
+         .text('No answers submitted.', 70, 380);
     }
 
-    // Add submissions information
+    // Add submissions information if available
     if (submissions && submissions.length > 0) {
-      doc.addPage()
-         .fontSize(16).font('Helvetica-Bold')
-         .text('File Submissions:', 50, 50);
+      let yPosition = doc.y + 30;
       
-      let yPosition = 80;
+      if (yPosition > 700) {
+        doc.addPage();
+        yPosition = 50;
+      }
+
+      doc.fontSize(14).font('Helvetica-Bold')
+         .text('File Submissions:', 50, yPosition);
+      
+      yPosition += 20;
+
       submissions.forEach((submission, index) => {
         if (yPosition > 700) {
           doc.addPage();
           yPosition = 50;
         }
         
-        doc.fontSize(12).font('Helvetica')
-           .text(`Submission ${index + 1}: ${submission.fileUrl || 'No file'}`, 50, yPosition);
+        doc.fontSize(10).font('Helvetica')
+           .text(`    Submission ${index + 1}: ${submission.fileUrl ? 'File Attached' : 'No file'}`, 70, yPosition);
         
-        yPosition += 30;
+        yPosition += 15;
       });
     }
 
@@ -196,6 +241,19 @@ exports.generateReportPDF = async (req, res) => {
     res.status(500).json({ error: 'Failed to generate PDF report' });
   }
 };
+
+// Helper function to format date like in screenshot (DD/MM/YYYY, HH:MM:SS)
+function formatDate(date) {
+  const d = new Date(date);
+  const day = String(d.getDate()).padStart(2, '0');
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const year = d.getFullYear();
+  const hours = String(d.getHours()).padStart(2, '0');
+  const minutes = String(d.getMinutes()).padStart(2, '0');
+  const seconds = String(d.getSeconds()).padStart(2, '0');
+  
+  return `${day}/${month}/${year}, ${hours}:${minutes}:${seconds}`;
+}
 
 // Get all exams
 exports.getAllExams = async (req, res) => {
