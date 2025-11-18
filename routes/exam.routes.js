@@ -18,5 +18,7 @@ router.get('/:examId/download-submissions', examController.downloadAllSubmission
 router.get('/:examId/download-reports', examController.downloadAllReports);
 router.post('/:examId/save-answers', examController.saveAnswers);
 router.get('/:examId/saved-answers/:uid', examController.getSavedAnswers);
+// New route for PDF generation
+router.post('/:examId/generate-report-pdf', examController.generateReportPDF);
 
 module.exports = router;
