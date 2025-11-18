@@ -5,11 +5,14 @@ const Student = require('../models/student.model');
 const Staff = require('../models/staff.model');
 const Submission = require('../models/submission.model');
 const ExamReport = require('../models/examReport.model');
-const SavedAnswer = require('../models/savedAnswer.model'); // Add new model
+const SavedAnswer = require('../models/savedAnswer.model');
 const admin = require('../firebaseAdmin');
 const multer = require('multer');
 const archiver = require('archiver');
 const { Readable } = require('stream');
+const PDFDocument = require('pdfkit');
+const path = require('path');
+const fs = require('fs');
 
 // Helper function to get school and semester by semesterId (classId)
 async function getSchoolAndSemester(classId) {
@@ -81,6 +84,117 @@ const handleMulterError = (err, req, res, next) => {
     return res.status(400).json({ error: err.message });
   }
   next(err);
+};
+
+// Generate PDF Report with University Logo and Student Info
+exports.generateReportPDF = async (req, res) => {
+  const { examId } = req.params;
+  const { student, submissions, report } = req.body;
+
+  try {
+    const exam = await Exam.findById(examId).lean();
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    // Create a PDF document
+    const doc = new PDFDocument();
+    
+    // Set response headers
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="exam-report-${student.name}.pdf"`);
+
+    // Pipe the PDF to the response
+    doc.pipe(res);
+
+    // Add logo (assuming the logo is in the public folder)
+    const logoPath = path.join(__dirname, '../../public/edenberg.jpg');
+    if (fs.existsSync(logoPath)) {
+      doc.image(logoPath, 50, 45, { width: 50 });
+    } else {
+      console.log('Logo not found at path:', logoPath);
+    }
+
+    // Add university title
+    doc.fontSize(20).font('Helvetica-Bold')
+       .text('University of Edenberg', 110, 50, { align: 'left' });
+
+    // Add student information
+    doc.fontSize(12).font('Helvetica')
+       .text(`Student Name: ${student.name || 'N/A'}`, 50, 120)
+       .text(`Email: ${student.email || 'N/A'}`, 50, 140)
+       .text(`School: ${student.school || 'University of Edenberg'}`, 50, 160)
+       .text(`Program: ${student.program || 'N/A'}`, 50, 180)
+       .text(`Batch: ${student.batch || 'N/A'}`, 50, 200);
+
+    // Add exam information
+    doc.fontSize(16).font('Helvetica-Bold')
+       .text('Exam Proctoring Report', 50, 240);
+    
+    doc.fontSize(12).font('Helvetica')
+       .text(`Exam: ${exam.title || 'Unknown'}`, 50, 270)
+       .text(`Status: ${report?.completed ? 'Completed' : 'Incomplete'}`, 50, 290)
+       .text(`Start Time: ${report?.startTime || 'N/A'}`, 50, 310)
+       .text(`End Time: ${report?.endTime || 'N/A'}`, 50, 330);
+
+    // Add student answers section
+    if (report?.userAnswers && Object.keys(report.userAnswers).length > 0) {
+      doc.addPage()
+         .fontSize(16).font('Helvetica-Bold')
+         .text('Student Answers:', 50, 50);
+      
+      let yPosition = 80;
+      Object.entries(report.userAnswers).forEach(([question, answer], index) => {
+        if (yPosition > 700) {
+          doc.addPage();
+          yPosition = 50;
+        }
+        
+        doc.fontSize(12).font('Helvetica-Bold')
+           .text(`Q${index + 1}: ${question}`, 50, yPosition);
+        
+        doc.fontSize(10).font('Helvetica')
+           .text(`Answer: ${answer.selectedAnswer || answer.answer || 'No answer'}`, 70, yPosition + 20);
+        
+        if (answer.wordCount) {
+          doc.text(`Word Count: ${answer.wordCount}`, 70, yPosition + 40);
+        }
+        
+        yPosition += 70;
+      });
+    } else {
+      doc.addPage()
+         .fontSize(12).font('Helvetica')
+         .text('No answers submitted.', 50, 50);
+    }
+
+    // Add submissions information
+    if (submissions && submissions.length > 0) {
+      doc.addPage()
+         .fontSize(16).font('Helvetica-Bold')
+         .text('File Submissions:', 50, 50);
+      
+      let yPosition = 80;
+      submissions.forEach((submission, index) => {
+        if (yPosition > 700) {
+          doc.addPage();
+          yPosition = 50;
+        }
+        
+        doc.fontSize(12).font('Helvetica')
+           .text(`Submission ${index + 1}: ${submission.fileUrl || 'No file'}`, 50, yPosition);
+        
+        yPosition += 30;
+      });
+    }
+
+    // Finalize the PDF
+    doc.end();
+
+  } catch (error) {
+    console.error('Error generating PDF:', error);
+    res.status(500).json({ error: 'Failed to generate PDF report' });
+  }
 };
 
 // Get all exams
@@ -673,10 +787,10 @@ exports.downloadAllReports = async (req, res) => {
   }
 };
 
-// Upload exam report (assuming implementation based on context)
+// Upload exam report
 exports.uploadExamReport = [uploadReportFile, handleMulterError, async (req, res) => {
   const { examId } = req.params;
-  const { uid } = req.body; // Assuming uid is sent in body
+  const { uid } = req.body;
   try {
     const student = await Student.findOne({ uid });
     if (!student) return res.status(404).json({ error: 'Student not found' });
@@ -739,7 +853,6 @@ exports.getExamReports = async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 };
-
 
 // Save student answers
 exports.saveAnswers = async (req, res) => {
@@ -823,6 +936,5 @@ exports.getSavedAnswers = async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 };
-
 
 exports.upload = upload;
